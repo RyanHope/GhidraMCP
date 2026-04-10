@@ -38,13 +38,17 @@ import ghidra.program.model.pcode.HighVariable;
 import ghidra.program.model.pcode.Varnode;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.DataTypeConflictHandler;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.Undefined1DataType;
-import ghidra.program.model.data.StructureDataType;
-import ghidra.program.model.data.Structure;
 import ghidra.program.model.data.EnumDataType;
+import ghidra.program.model.data.StructureDataType;
 import ghidra.program.model.data.CategoryPath;
-import ghidra.program.model.data.Category;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
@@ -62,6 +66,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
@@ -346,85 +351,83 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
         });
 
-        server.createContext("/searchVariables", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
-            String pattern = qparams.get("pattern");
-            int offset = parseIntOrDefault(qparams.get("offset"), 0);
-            int limit = parseIntOrDefault(qparams.get("limit"), 100);
-            sendResponse(exchange, searchVariablesByPattern(pattern, offset, limit));
-        });
-
-        // ----------------------------------------------------------------------------------
-        // Structure/Type Management Endpoints
-        // ----------------------------------------------------------------------------------
-
-        server.createContext("/create_struct", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String name = params.get("name");
-            int size = parseIntOrDefault(params.get("size"), 0);
-            String category = params.get("category");
-            sendResponse(exchange, createStructure(name, size, category));
-        });
-
-        server.createContext("/add_struct_field", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String structName = params.get("struct_name");
-            int offset = parseIntOrDefault(params.get("offset"), -1);
-            String fieldType = params.get("field_type");
-            String fieldName = params.get("field_name");
-            int fieldSize = parseIntOrDefault(params.get("field_size"), 0);
-            sendResponse(exchange, addStructField(structName, offset, fieldType, fieldName, fieldSize));
-        });
-
-        server.createContext("/list_structs", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
-            int offset = parseIntOrDefault(qparams.get("offset"), 0);
-            int limit = parseIntOrDefault(qparams.get("limit"), 100);
-            String filter = qparams.get("filter");
-            sendResponse(exchange, listStructures(offset, limit, filter));
-        });
-
-        server.createContext("/get_struct", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
-            String name = qparams.get("name");
-            sendResponse(exchange, getStructureDetails(name));
-        });
-
-        server.createContext("/apply_struct_at_address", exchange -> {
+        server.createContext("/clear_data", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             String address = params.get("address");
-            String structName = params.get("struct_name");
-            sendResponse(exchange, applyStructureAtAddress(address, structName));
+            String size = params.get("size");
+            String result = clearData(address, size);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/define_data", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String dataType = params.get("data_type");
+            String label = params.get("label");
+            String result = defineData(address, dataType, label);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/define_data_batch", exchange -> {
+            String body = readRequestBody(exchange);
+            String result = defineDataBatch(body);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/read_bytes", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            String length = qparams.get("length");
+            String result = readBytes(address, length);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/get_data_at", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            String result = getDataAt(address);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/batch_rename_functions", exchange -> {
+            String body = readRequestBody(exchange);
+            String result = batchRenameFunctions(body);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/batch_set_comments", exchange -> {
+            String body = readRequestBody(exchange);
+            String result = batchSetComments(body);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/create_label", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String name = params.get("name");
+            String namespace = params.get("namespace");
+            String result = createLabel(address, name, namespace);
+            sendResponse(exchange, result);
         });
 
         server.createContext("/create_enum", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String name = params.get("name");
-            int size = parseIntOrDefault(params.get("size"), 4);
-            String category = params.get("category");
-            sendResponse(exchange, createEnum(name, size, category));
+            String body = readRequestBody(exchange);
+            String result = createEnum(body);
+            sendResponse(exchange, result);
         });
 
-        server.createContext("/add_enum_value", exchange -> {
-            Map<String, String> params = parsePostParams(exchange);
-            String enumName = params.get("enum_name");
-            String valueName = params.get("value_name");
-            long value = Long.parseLong(params.getOrDefault("value", "0"));
-            sendResponse(exchange, addEnumValue(enumName, valueName, value));
+        server.createContext("/create_struct", exchange -> {
+            String body = readRequestBody(exchange);
+            String result = createStruct(body);
+            sendResponse(exchange, result);
         });
 
-        server.createContext("/list_types", exchange -> {
-            Map<String, String> qparams = parseQueryParams(exchange);
-            int offset = parseIntOrDefault(qparams.get("offset"), 0);
-            int limit = parseIntOrDefault(qparams.get("limit"), 100);
-            String category = qparams.get("category");
-            sendResponse(exchange, listDataTypes(offset, limit, category));
-        });
-
-        server.createContext("/delete_struct", exchange -> {
+        server.createContext("/apply_struct", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
-            String name = params.get("name");
-            sendResponse(exchange, deleteStructure(name));
+            String address = params.get("address");
+            String structName = params.get("struct_name");
+            String result = applyStruct(address, structName);
+            sendResponse(exchange, result);
         });
 
         server.setExecutor(null);
@@ -676,106 +679,77 @@ public class GhidraMCPPlugin extends Plugin {
         }
 
         if (func == null) {
-            decomp.dispose();
             return "Function not found";
         }
 
         DecompileResults result = decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
         if (result == null || !result.decompileCompleted()) {
-            decomp.dispose();
             return "Decompilation failed";
         }
 
         HighFunction highFunction = result.getHighFunction();
         if (highFunction == null) {
-            decomp.dispose();
             return "Decompilation failed (no high function)";
         }
 
         LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
         if (localSymbolMap == null) {
-            decomp.dispose();
             return "Decompilation failed (no local symbol map)";
         }
 
-        // Collect all variable names and find target variable
         HighSymbol highSymbol = null;
-        List<String> availableVars = new ArrayList<>();
         Iterator<HighSymbol> symbols = localSymbolMap.getSymbols();
         while (symbols.hasNext()) {
             HighSymbol symbol = symbols.next();
             String symbolName = symbol.getName();
-            availableVars.add(symbolName);
-
+            
             if (symbolName.equals(oldVarName)) {
                 highSymbol = symbol;
             }
             if (symbolName.equals(newVarName)) {
-                decomp.dispose();
                 return "Error: A variable with name '" + newVarName + "' already exists in this function";
             }
         }
 
         if (highSymbol == null) {
-            decomp.dispose();
-            // Provide helpful error message with available variable names
-            String availableList = availableVars.isEmpty() ? "(none)" : String.join(", ", availableVars);
-            return "Variable '" + oldVarName + "' not found. Available variables: " + availableList;
+            return "Variable not found";
         }
 
         boolean commitRequired = checkFullCommit(highSymbol, highFunction);
 
         final HighSymbol finalHighSymbol = highSymbol;
-        final HighFunction finalHighFunction = highFunction;
         final Function finalFunction = func;
-        StringBuilder errorMsg = new StringBuilder();
         AtomicBoolean successFlag = new AtomicBoolean(false);
 
         try {
-            SwingUtilities.invokeAndWait(() -> {
+            SwingUtilities.invokeAndWait(() -> {           
                 int tx = program.startTransaction("Rename variable");
-                boolean success = false;
                 try {
-                    // First commit the decompiler's locals to the database if needed
-                    // This ensures auto-generated names like uVar1, local_10 are available
                     if (commitRequired) {
-                        HighFunctionDBUtil.commitParamsToDatabase(finalHighFunction, false,
+                        HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
                             ReturnCommitOption.NO_COMMIT, finalFunction.getSignatureSource());
                     }
-                    // Always commit local names to make sure variable exists in DB
-                    HighFunctionDBUtil.commitLocalNamesToDatabase(finalHighFunction, SourceType.USER_DEFINED);
-
                     HighFunctionDBUtil.updateDBVariable(
                         finalHighSymbol,
                         newVarName,
                         null,
                         SourceType.USER_DEFINED
                     );
-                    success = true;
+                    successFlag.set(true);
                 }
                 catch (Exception e) {
-                    errorMsg.append(e.getMessage());
                     Msg.error(this, "Failed to rename variable", e);
                 }
                 finally {
-                    program.endTransaction(tx, success);
-                    successFlag.set(success);
+                    successFlag.set(program.endTransaction(tx, true));
                 }
             });
         } catch (InterruptedException | InvocationTargetException e) {
-            decomp.dispose();
-            String errStr = "Failed to execute rename on Swing thread: " + e.getMessage();
-            Msg.error(this, errStr, e);
-            return errStr;
+            String errorMsg = "Failed to execute rename on Swing thread: " + e.getMessage();
+            Msg.error(this, errorMsg, e);
+            return errorMsg;
         }
-
-        decomp.dispose();
-
-        if (successFlag.get()) {
-            return "Variable renamed";
-        } else {
-            return "Failed to rename variable" + (errorMsg.length() > 0 ? ": " + errorMsg.toString() : "");
-        }
+        return successFlag.get() ? "Variable renamed" : "Failed to rename variable";
     }
 
     /**
@@ -1505,86 +1479,11 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * Search for variables across all functions whose name matches a pattern
-     * @param pattern The pattern to search for (e.g., "param_", "iVar", "local_")
-     * @param offset Pagination offset
-     * @param limit Maximum number of results
-     * @return List of matches in format: "FunctionName: variableName (type)"
-     */
-    private String searchVariablesByPattern(String pattern, int offset, int limit) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (pattern == null || pattern.isEmpty()) return "Pattern is required";
-
-        List<String> matches = new ArrayList<>();
-        DecompInterface decomp = new DecompInterface();
-        decomp.openProgram(program);
-
-        // Convert pattern to lowercase for case-insensitive matching
-        String lowerPattern = pattern.toLowerCase();
-
-        // Iterate through all functions
-        for (Function func : program.getFunctionManager().getFunctions(true)) {
-            try {
-                // Decompile the function (with short timeout to avoid hanging)
-                DecompileResults result = decomp.decompileFunction(func, 10, new ConsoleTaskMonitor());
-                if (result == null || !result.decompileCompleted()) {
-                    continue;
-                }
-
-                HighFunction highFunction = result.getHighFunction();
-                if (highFunction == null) {
-                    continue;
-                }
-
-                LocalSymbolMap localSymbolMap = highFunction.getLocalSymbolMap();
-                if (localSymbolMap == null) {
-                    continue;
-                }
-
-                // Iterate through all variables in this function
-                Iterator<HighSymbol> symbols = localSymbolMap.getSymbols();
-                while (symbols.hasNext()) {
-                    HighSymbol symbol = symbols.next();
-                    String varName = symbol.getName();
-
-                    // Check if variable name contains the pattern (case-insensitive)
-                    if (varName.toLowerCase().contains(lowerPattern)) {
-                        String typeName = "unknown";
-                        HighVariable highVar = symbol.getHighVariable();
-                        if (highVar != null && highVar.getDataType() != null) {
-                            typeName = highVar.getDataType().getName();
-                        }
-
-                        matches.add(String.format("%s @ %s: %s (%s)",
-                            func.getName(),
-                            func.getEntryPoint(),
-                            varName,
-                            typeName));
-                    }
-                }
-            } catch (Exception e) {
-                // Skip functions that fail to decompile
-                continue;
-            }
-        }
-
-        decomp.dispose();
-
-        if (matches.isEmpty()) {
-            return "No variables matching pattern '" + pattern + "'";
-        }
-
-        Collections.sort(matches);
-        return paginateList(matches, offset, limit);
-    }
-
-    /**
      * Escape special characters in a string for display
      */
     private String escapeString(String input) {
         if (input == null) return "";
-
+        
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < input.length(); i++) {
             char c = input.charAt(i);
@@ -1602,464 +1501,6 @@ public class GhidraMCPPlugin extends Plugin {
         }
         return sb.toString();
     }
-
-    // ----------------------------------------------------------------------------------
-    // Structure/Type Management Methods
-    // ----------------------------------------------------------------------------------
-
-    /**
-     * Create a new structure with the given name and size
-     * @param name Structure name
-     * @param size Initial size in bytes (0 for undefined/growable)
-     * @param categoryPath Category path (e.g., "/MyStructs" or null for root)
-     * @return Success or error message
-     */
-    private String createStructure(String name, int size, String categoryPath) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (name == null || name.isEmpty()) return "Structure name is required";
-
-        AtomicBoolean success = new AtomicBoolean(false);
-        StringBuilder result = new StringBuilder();
-
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create structure");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-
-                    // Check if structure already exists
-                    DataType existing = findDataTypeByNameInAllCategories(dtm, name);
-                    if (existing != null) {
-                        result.append("Structure '").append(name).append("' already exists at ").append(existing.getPathName());
-                        return;
-                    }
-
-                    // Create category path if specified
-                    CategoryPath catPath = CategoryPath.ROOT;
-                    if (categoryPath != null && !categoryPath.isEmpty()) {
-                        catPath = new CategoryPath(categoryPath);
-                    }
-
-                    // Create the structure
-                    StructureDataType struct = new StructureDataType(catPath, name, size, dtm);
-
-                    // Add to data type manager
-                    DataType resolved = dtm.addDataType(struct, null);
-
-                    result.append("Created structure '").append(name).append("' at ").append(resolved.getPathName());
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error creating structure: ").append(e.getMessage());
-                    Msg.error(this, "Error creating structure", e);
-                } finally {
-                    program.endTransaction(tx, success.get());
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            return "Failed to execute on Swing thread: " + e.getMessage();
-        }
-
-        return result.toString();
-    }
-
-    /**
-     * Add a field to an existing structure
-     * @param structName Name of the structure
-     * @param offset Offset in bytes (-1 to append)
-     * @param fieldTypeName Data type name for the field
-     * @param fieldName Name of the field
-     * @param fieldSize Size override (0 to use type's natural size)
-     * @return Success or error message
-     */
-    private String addStructField(String structName, int offset, String fieldTypeName, String fieldName, int fieldSize) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (structName == null || structName.isEmpty()) return "Structure name is required";
-        if (fieldTypeName == null || fieldTypeName.isEmpty()) return "Field type is required";
-
-        AtomicBoolean success = new AtomicBoolean(false);
-        StringBuilder result = new StringBuilder();
-
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Add struct field");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-
-                    // Find the structure
-                    DataType dt = findDataTypeByNameInAllCategories(dtm, structName);
-                    if (dt == null) {
-                        result.append("Structure '").append(structName).append("' not found");
-                        return;
-                    }
-
-                    if (!(dt instanceof Structure)) {
-                        result.append("'").append(structName).append("' is not a structure");
-                        return;
-                    }
-
-                    Structure struct = (Structure) dt;
-
-                    // Find the field type
-                    DataType fieldType = resolveDataType(dtm, fieldTypeName);
-                    if (fieldType == null) {
-                        result.append("Field type '").append(fieldTypeName).append("' not found");
-                        return;
-                    }
-
-                    // Use field size if provided, otherwise use type's size
-                    int actualSize = fieldSize > 0 ? fieldSize : fieldType.getLength();
-
-                    // Add the field
-                    if (offset < 0) {
-                        // Append to end
-                        struct.add(fieldType, actualSize, fieldName, null);
-                        result.append("Added field '").append(fieldName).append("' at end of ").append(structName);
-                    } else {
-                        // Insert at specific offset
-                        struct.replaceAtOffset(offset, fieldType, actualSize, fieldName, null);
-                        result.append("Added field '").append(fieldName).append("' at offset ").append(offset).append(" in ").append(structName);
-                    }
-
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error adding field: ").append(e.getMessage());
-                    Msg.error(this, "Error adding struct field", e);
-                } finally {
-                    program.endTransaction(tx, success.get());
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            return "Failed to execute on Swing thread: " + e.getMessage();
-        }
-
-        return result.toString();
-    }
-
-    /**
-     * List all structures in the program
-     * @param offset Pagination offset
-     * @param limit Maximum results
-     * @param filter Optional name filter
-     * @return List of structure names
-     */
-    private String listStructures(int offset, int limit, String filter) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-
-        List<String> structures = new ArrayList<>();
-        DataTypeManager dtm = program.getDataTypeManager();
-
-        Iterator<DataType> allTypes = dtm.getAllDataTypes();
-        while (allTypes.hasNext()) {
-            DataType dt = allTypes.next();
-            if (dt instanceof Structure) {
-                Structure struct = (Structure) dt;
-                String entry = String.format("%s (size: %d, fields: %d) at %s",
-                    struct.getName(),
-                    struct.getLength(),
-                    struct.getNumComponents(),
-                    struct.getPathName());
-
-                if (filter == null || struct.getName().toLowerCase().contains(filter.toLowerCase())) {
-                    structures.add(entry);
-                }
-            }
-        }
-
-        Collections.sort(structures);
-        return paginateList(structures, offset, limit);
-    }
-
-    /**
-     * Get detailed information about a structure
-     * @param name Structure name
-     * @return Structure details including all fields
-     */
-    private String getStructureDetails(String name) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (name == null || name.isEmpty()) return "Structure name is required";
-
-        DataTypeManager dtm = program.getDataTypeManager();
-        DataType dt = findDataTypeByNameInAllCategories(dtm, name);
-
-        if (dt == null) {
-            return "Structure '" + name + "' not found";
-        }
-
-        if (!(dt instanceof Structure)) {
-            return "'" + name + "' is not a structure (type: " + dt.getClass().getSimpleName() + ")";
-        }
-
-        Structure struct = (Structure) dt;
-        StringBuilder sb = new StringBuilder();
-
-        sb.append("Structure: ").append(struct.getName()).append("\n");
-        sb.append("Path: ").append(struct.getPathName()).append("\n");
-        sb.append("Size: ").append(struct.getLength()).append(" bytes\n");
-        sb.append("Alignment: ").append(struct.getAlignment()).append("\n");
-        sb.append("Fields (").append(struct.getNumComponents()).append("):\n");
-
-        for (int i = 0; i < struct.getNumComponents(); i++) {
-            ghidra.program.model.data.DataTypeComponent comp = struct.getComponent(i);
-            sb.append(String.format("  +0x%04X: %s %s (size: %d)\n",
-                comp.getOffset(),
-                comp.getDataType().getName(),
-                comp.getFieldName() != null ? comp.getFieldName() : "(unnamed)",
-                comp.getLength()));
-        }
-
-        return sb.toString();
-    }
-
-    /**
-     * Apply a structure type at a specific address
-     * @param addressStr Address to apply structure
-     * @param structName Name of the structure to apply
-     * @return Success or error message
-     */
-    private String applyStructureAtAddress(String addressStr, String structName) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
-        if (structName == null || structName.isEmpty()) return "Structure name is required";
-
-        AtomicBoolean success = new AtomicBoolean(false);
-        StringBuilder result = new StringBuilder();
-
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Apply structure");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-                    Address addr = program.getAddressFactory().getAddress(addressStr);
-
-                    // Find the structure
-                    DataType dt = findDataTypeByNameInAllCategories(dtm, structName);
-                    if (dt == null) {
-                        result.append("Structure '").append(structName).append("' not found");
-                        return;
-                    }
-
-                    // Clear any existing data at the address
-                    Listing listing = program.getListing();
-                    listing.clearCodeUnits(addr, addr.add(dt.getLength() - 1), false);
-
-                    // Apply the data type
-                    listing.createData(addr, dt);
-
-                    result.append("Applied '").append(structName).append("' at ").append(addressStr);
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error applying structure: ").append(e.getMessage());
-                    Msg.error(this, "Error applying structure", e);
-                } finally {
-                    program.endTransaction(tx, success.get());
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            return "Failed to execute on Swing thread: " + e.getMessage();
-        }
-
-        return result.toString();
-    }
-
-    /**
-     * Create a new enum type
-     * @param name Enum name
-     * @param size Size in bytes (1, 2, 4, or 8)
-     * @param categoryPath Category path or null for root
-     * @return Success or error message
-     */
-    private String createEnum(String name, int size, String categoryPath) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (name == null || name.isEmpty()) return "Enum name is required";
-
-        AtomicBoolean success = new AtomicBoolean(false);
-        StringBuilder result = new StringBuilder();
-
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Create enum");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-
-                    // Check if enum already exists
-                    DataType existing = findDataTypeByNameInAllCategories(dtm, name);
-                    if (existing != null) {
-                        result.append("Type '").append(name).append("' already exists at ").append(existing.getPathName());
-                        return;
-                    }
-
-                    CategoryPath catPath = CategoryPath.ROOT;
-                    if (categoryPath != null && !categoryPath.isEmpty()) {
-                        catPath = new CategoryPath(categoryPath);
-                    }
-
-                    EnumDataType enumType = new EnumDataType(catPath, name, size, dtm);
-                    DataType resolved = dtm.addDataType(enumType, null);
-
-                    result.append("Created enum '").append(name).append("' at ").append(resolved.getPathName());
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error creating enum: ").append(e.getMessage());
-                    Msg.error(this, "Error creating enum", e);
-                } finally {
-                    program.endTransaction(tx, success.get());
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            return "Failed to execute on Swing thread: " + e.getMessage();
-        }
-
-        return result.toString();
-    }
-
-    /**
-     * Add a value to an existing enum
-     * @param enumName Name of the enum
-     * @param valueName Name of the enum value
-     * @param value Numeric value
-     * @return Success or error message
-     */
-    private String addEnumValue(String enumName, String valueName, long value) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (enumName == null || enumName.isEmpty()) return "Enum name is required";
-        if (valueName == null || valueName.isEmpty()) return "Value name is required";
-
-        AtomicBoolean success = new AtomicBoolean(false);
-        StringBuilder result = new StringBuilder();
-
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Add enum value");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-
-                    DataType dt = findDataTypeByNameInAllCategories(dtm, enumName);
-                    if (dt == null) {
-                        result.append("Enum '").append(enumName).append("' not found");
-                        return;
-                    }
-
-                    if (!(dt instanceof ghidra.program.model.data.Enum)) {
-                        result.append("'").append(enumName).append("' is not an enum");
-                        return;
-                    }
-
-                    ghidra.program.model.data.Enum enumType = (ghidra.program.model.data.Enum) dt;
-                    enumType.add(valueName, value);
-
-                    result.append("Added '").append(valueName).append("' = ").append(value).append(" to ").append(enumName);
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error adding enum value: ").append(e.getMessage());
-                    Msg.error(this, "Error adding enum value", e);
-                } finally {
-                    program.endTransaction(tx, success.get());
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            return "Failed to execute on Swing thread: " + e.getMessage();
-        }
-
-        return result.toString();
-    }
-
-    /**
-     * List all data types in a category
-     * @param offset Pagination offset
-     * @param limit Maximum results
-     * @param categoryPath Category to list (null for all)
-     * @return List of type names
-     */
-    private String listDataTypes(int offset, int limit, String categoryPath) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-
-        List<String> types = new ArrayList<>();
-        DataTypeManager dtm = program.getDataTypeManager();
-
-        if (categoryPath != null && !categoryPath.isEmpty()) {
-            // List types in specific category
-            CategoryPath catPath = new CategoryPath(categoryPath);
-            Category cat = dtm.getCategory(catPath);
-            if (cat == null) {
-                return "Category '" + categoryPath + "' not found";
-            }
-
-            for (DataType dt : cat.getDataTypes()) {
-                types.add(String.format("%s (%s) - size: %d",
-                    dt.getName(),
-                    dt.getClass().getSimpleName().replace("DataType", ""),
-                    dt.getLength()));
-            }
-        } else {
-            // List all types
-            Iterator<DataType> allTypes = dtm.getAllDataTypes();
-            while (allTypes.hasNext()) {
-                DataType dt = allTypes.next();
-                types.add(String.format("%s (%s) at %s",
-                    dt.getName(),
-                    dt.getClass().getSimpleName().replace("DataType", ""),
-                    dt.getPathName()));
-            }
-        }
-
-        Collections.sort(types);
-        return paginateList(types, offset, limit);
-    }
-
-    /**
-     * Delete a structure
-     * @param name Structure name
-     * @return Success or error message
-     */
-    private String deleteStructure(String name) {
-        Program program = getCurrentProgram();
-        if (program == null) return "No program loaded";
-        if (name == null || name.isEmpty()) return "Structure name is required";
-
-        AtomicBoolean success = new AtomicBoolean(false);
-        StringBuilder result = new StringBuilder();
-
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Delete structure");
-                try {
-                    DataTypeManager dtm = program.getDataTypeManager();
-
-                    DataType dt = findDataTypeByNameInAllCategories(dtm, name);
-                    if (dt == null) {
-                        result.append("Structure '").append(name).append("' not found");
-                        return;
-                    }
-
-                    dtm.remove(dt, new ConsoleTaskMonitor());
-
-                    result.append("Deleted '").append(name).append("'");
-                    success.set(true);
-                } catch (Exception e) {
-                    result.append("Error deleting structure: ").append(e.getMessage());
-                    Msg.error(this, "Error deleting structure", e);
-                } finally {
-                    program.endTransaction(tx, success.get());
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            return "Failed to execute on Swing thread: " + e.getMessage();
-        }
-
-        return result.toString();
-    }
-
-    // ----------------------------------------------------------------------------------
-    // End Structure/Type Management Methods
-    // ----------------------------------------------------------------------------------
 
     /**
      * Resolves a data type by name, handling common types and pointer types
@@ -2122,6 +1563,14 @@ public class GhidraMCPPlugin extends Plugin {
             case "ulonglong":
             case "unsigned __int64":
                 return dtm.getDataType("/ulonglong");
+            case "float":
+                return dtm.getDataType("/float");
+            case "double":
+                return dtm.getDataType("/double");
+            case "qword":
+                return dtm.getDataType("/longlong");
+            case "pointer":
+                return new PointerDataType();
             case "bool":
             case "boolean":
                 return dtm.getDataType("/bool");
@@ -2175,6 +1624,519 @@ public class GhidraMCPPlugin extends Plugin {
         return null;
     }
 
+    private String clearData(String addressStr, String sizeStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to clear data");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Clear data");
+                boolean success = false;
+                try {
+                    Address start = program.getAddressFactory().getAddress(addressStr);
+                    Listing listing = program.getListing();
+
+                    Address end;
+                    if (sizeStr != null && !sizeStr.isEmpty()) {
+                        int size = Integer.parseInt(sizeStr);
+                        end = start.add(size - 1);
+                    } else {
+                        Data data = listing.getDataAt(start);
+                        if (data == null) {
+                            data = listing.getDataContaining(start);
+                        }
+                        if (data != null) {
+                            end = start.add(data.getLength() - 1);
+                        } else {
+                            end = start;
+                        }
+                    }
+
+                    listing.clearCodeUnits(start, end, false);
+                    success = true;
+                    result.set("Cleared data from " + start + " to " + end);
+                } catch (Exception e) {
+                    Msg.error(this, "Error clearing data", e);
+                    result.set("Error clearing data: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute clear data on Swing thread", e);
+        }
+
+        return result.get();
+    }
+
+    private String defineData(String addressStr, String dataTypeName, String label) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (dataTypeName == null || dataTypeName.isEmpty()) return "Data type is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to define data");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Define data");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dt = resolveDataType(dtm, dataTypeName);
+
+                    program.getListing().createData(addr, dt);
+
+                    if (label != null && !label.isEmpty()) {
+                        program.getSymbolTable().createLabel(addr, label, SourceType.USER_DEFINED);
+                    }
+
+                    success = true;
+                    result.set("Defined " + dataTypeName + " at " + addr +
+                              (label != null && !label.isEmpty() ? " with label " + label : ""));
+                } catch (Exception e) {
+                    Msg.error(this, "Error defining data", e);
+                    result.set("Error defining data: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute define data on Swing thread", e);
+        }
+
+        return result.get();
+    }
+
+    private String defineDataBatch(String jsonBody) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (jsonBody == null || jsonBody.isEmpty()) return "JSON body is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to define data batch");
+
+        try {
+            JsonArray items = JsonParser.parseString(jsonBody).getAsJsonArray();
+
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Define data batch");
+                boolean success = false;
+                int succeeded = 0;
+                int failed = 0;
+                StringBuilder errors = new StringBuilder();
+
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    Listing listing = program.getListing();
+                    SymbolTable symTable = program.getSymbolTable();
+
+                    for (JsonElement el : items) {
+                        JsonObject item = el.getAsJsonObject();
+                        String addr = item.get("address").getAsString();
+                        String typeName = item.get("data_type").getAsString();
+                        String label = item.has("label") ? item.get("label").getAsString() : null;
+
+                        try {
+                            Address address = program.getAddressFactory().getAddress(addr);
+                            DataType dt = resolveDataType(dtm, typeName);
+                            listing.createData(address, dt);
+
+                            if (label != null && !label.isEmpty()) {
+                                symTable.createLabel(address, label, SourceType.USER_DEFINED);
+                            }
+                            succeeded++;
+                        } catch (Exception e) {
+                            failed++;
+                            errors.append(addr).append(": ").append(e.getMessage()).append("\n");
+                        }
+                    }
+
+                    success = succeeded > 0;
+                    result.set("Total: " + items.size() + ", Succeeded: " + succeeded +
+                              ", Failed: " + failed +
+                              (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
+                } catch (Exception e) {
+                    Msg.error(this, "Error in define data batch", e);
+                    result.set("Error in batch: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (Exception e) {
+            result.set("Error parsing JSON: " + e.getMessage());
+        }
+
+        return result.get();
+    }
+
+    private String readBytes(String addressStr, String lengthStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (lengthStr == null || lengthStr.isEmpty()) return "Length is required";
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            int length = Integer.parseInt(lengthStr);
+            byte[] bytes = new byte[length];
+            program.getMemory().getBytes(addr, bytes);
+
+            StringBuilder hex = new StringBuilder();
+            for (byte b : bytes) {
+                hex.append(String.format("%02x", b & 0xFF));
+            }
+            return hex.toString();
+        } catch (Exception e) {
+            return "Error reading bytes: " + e.getMessage();
+        }
+    }
+
+    private String getDataAt(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            Listing listing = program.getListing();
+
+            Data data = listing.getDataAt(addr);
+            String matchType = "exact";
+            if (data == null) {
+                data = listing.getDataContaining(addr);
+                matchType = "containing";
+            }
+
+            if (data == null) {
+                return "No data defined at " + addressStr;
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("Address: ").append(data.getAddress()).append("\n");
+            sb.append("Match: ").append(matchType).append("\n");
+            sb.append("Type: ").append(data.getDataType().getName()).append("\n");
+            sb.append("Size: ").append(data.getLength()).append(" bytes\n");
+            sb.append("Value: ").append(data.getDefaultValueRepresentation()).append("\n");
+
+            Symbol[] symbols = program.getSymbolTable().getSymbols(data.getAddress());
+            if (symbols.length > 0) {
+                sb.append("Label: ").append(symbols[0].getName()).append("\n");
+            }
+
+            if ("containing".equals(matchType)) {
+                long offset = addr.subtract(data.getAddress());
+                sb.append("Offset within item: ").append(offset).append("\n");
+            }
+
+            return sb.toString();
+        } catch (Exception e) {
+            return "Error getting data: " + e.getMessage();
+        }
+    }
+
+    private String batchRenameFunctions(String jsonBody) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (jsonBody == null || jsonBody.isEmpty()) return "JSON body is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to batch rename");
+
+        try {
+            JsonArray items = JsonParser.parseString(jsonBody).getAsJsonArray();
+
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Batch rename functions");
+                boolean success = false;
+                int succeeded = 0;
+                int failed = 0;
+                StringBuilder errors = new StringBuilder();
+
+                try {
+                    for (JsonElement el : items) {
+                        JsonObject item = el.getAsJsonObject();
+                        String addr = item.get("address").getAsString();
+                        String newName = item.get("new_name").getAsString();
+
+                        try {
+                            Address address = program.getAddressFactory().getAddress(addr);
+                            Function func = getFunctionForAddress(program, address);
+                            if (func == null) {
+                                failed++;
+                                errors.append(addr).append(": No function at address\n");
+                                continue;
+                            }
+                            func.setName(newName, SourceType.USER_DEFINED);
+                            succeeded++;
+                        } catch (Exception e) {
+                            failed++;
+                            errors.append(addr).append(": ").append(e.getMessage()).append("\n");
+                        }
+                    }
+
+                    success = succeeded > 0;
+                    result.set("Total: " + items.size() + ", Succeeded: " + succeeded +
+                              ", Failed: " + failed +
+                              (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
+                } catch (Exception e) {
+                    Msg.error(this, "Error in batch rename", e);
+                    result.set("Error in batch: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (Exception e) {
+            result.set("Error parsing JSON: " + e.getMessage());
+        }
+
+        return result.get();
+    }
+
+    private String batchSetComments(String jsonBody) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (jsonBody == null || jsonBody.isEmpty()) return "JSON body is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to batch set comments");
+
+        try {
+            JsonObject body = JsonParser.parseString(jsonBody).getAsJsonObject();
+            String commentTypeStr = body.has("comment_type") ? body.get("comment_type").getAsString() : "decompiler";
+            int commentType = "disassembly".equalsIgnoreCase(commentTypeStr)
+                    ? CodeUnit.EOL_COMMENT : CodeUnit.PRE_COMMENT;
+            JsonArray comments = body.getAsJsonArray("comments");
+
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Batch set comments");
+                boolean success = false;
+                int succeeded = 0;
+                int failed = 0;
+                StringBuilder errors = new StringBuilder();
+
+                try {
+                    Listing listing = program.getListing();
+
+                    for (JsonElement el : comments) {
+                        JsonObject item = el.getAsJsonObject();
+                        String addr = item.get("address").getAsString();
+                        String comment = item.get("comment").getAsString();
+
+                        try {
+                            Address address = program.getAddressFactory().getAddress(addr);
+                            listing.setComment(address, commentType, comment);
+                            succeeded++;
+                        } catch (Exception e) {
+                            failed++;
+                            errors.append(addr).append(": ").append(e.getMessage()).append("\n");
+                        }
+                    }
+
+                    success = succeeded > 0;
+                    result.set("Total: " + comments.size() + ", Succeeded: " + succeeded +
+                              ", Failed: " + failed +
+                              (errors.length() > 0 ? "\nErrors:\n" + errors : ""));
+                } catch (Exception e) {
+                    Msg.error(this, "Error in batch set comments", e);
+                    result.set("Error in batch: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (Exception e) {
+            result.set("Error parsing JSON: " + e.getMessage());
+        }
+
+        return result.get();
+    }
+
+    private String createLabel(String addressStr, String name, String namespace) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (name == null || name.isEmpty()) return "Name is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to create label");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create label");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    SymbolTable symTable = program.getSymbolTable();
+
+                    Namespace ns = null;
+                    if (namespace != null && !namespace.isEmpty()) {
+                        ns = symTable.getNamespace(namespace, null);
+                        if (ns == null) {
+                            ns = symTable.createNameSpace(null, namespace, SourceType.USER_DEFINED);
+                        }
+                    }
+
+                    if (ns != null) {
+                        symTable.createLabel(addr, name, ns, SourceType.USER_DEFINED);
+                    } else {
+                        symTable.createLabel(addr, name, SourceType.USER_DEFINED);
+                    }
+
+                    success = true;
+                    result.set("Label '" + name + "' created at " + addr);
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating label", e);
+                    result.set("Error creating label: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute create label on Swing thread", e);
+        }
+
+        return result.get();
+    }
+
+    private String createEnum(String jsonBody) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (jsonBody == null || jsonBody.isEmpty()) return "JSON body is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to create enum");
+
+        try {
+            JsonObject body = JsonParser.parseString(jsonBody).getAsJsonObject();
+            String name = body.get("name").getAsString();
+            int size = body.has("size") ? body.get("size").getAsInt() : 4;
+            JsonArray values = body.getAsJsonArray("values");
+
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create enum");
+                boolean success = false;
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    EnumDataType enumType = new EnumDataType(name, size);
+
+                    for (JsonElement el : values) {
+                        JsonObject entry = el.getAsJsonObject();
+                        String entryName = entry.get("name").getAsString();
+                        long entryValue = entry.get("value").getAsLong();
+                        enumType.add(entryName, entryValue);
+                    }
+
+                    dtm.addDataType(enumType, DataTypeConflictHandler.REPLACE_HANDLER);
+                    success = true;
+                    result.set("Enum '" + name + "' created with " + values.size() + " values");
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating enum", e);
+                    result.set("Error creating enum: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (Exception e) {
+            result.set("Error parsing JSON: " + e.getMessage());
+        }
+
+        return result.get();
+    }
+
+    private String createStruct(String jsonBody) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (jsonBody == null || jsonBody.isEmpty()) return "JSON body is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to create struct");
+
+        try {
+            JsonObject body = JsonParser.parseString(jsonBody).getAsJsonObject();
+            String name = body.get("name").getAsString();
+            JsonArray fields = body.getAsJsonArray("fields");
+
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create struct");
+                boolean success = false;
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    StructureDataType struct = new StructureDataType(name, 0);
+
+                    for (JsonElement el : fields) {
+                        JsonObject field = el.getAsJsonObject();
+                        String fieldName = field.get("name").getAsString();
+                        String fieldType = field.get("type").getAsString();
+                        int fieldSize = field.has("size") ? field.get("size").getAsInt() : 0;
+
+                        DataType dt = resolveDataType(dtm, fieldType);
+                        if (fieldSize > 0) {
+                            struct.add(dt, fieldSize, fieldName, null);
+                        } else {
+                            struct.add(dt, dt.getLength(), fieldName, null);
+                        }
+                    }
+
+                    dtm.addDataType(struct, DataTypeConflictHandler.REPLACE_HANDLER);
+                    success = true;
+                    result.set("Struct '" + name + "' created with " + fields.size() +
+                              " fields, total size: " + struct.getLength() + " bytes");
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating struct", e);
+                    result.set("Error creating struct: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (Exception e) {
+            result.set("Error parsing JSON: " + e.getMessage());
+        }
+
+        return result.get();
+    }
+
+    private String applyStruct(String addressStr, String structName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (structName == null || structName.isEmpty()) return "Struct name is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to apply struct");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Apply struct");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dt = findDataTypeByNameInAllCategories(dtm, structName);
+
+                    if (dt == null) {
+                        result.set("Struct '" + structName + "' not found");
+                        return;
+                    }
+
+                    Listing listing = program.getListing();
+                    // Clear existing data at the address range
+                    listing.clearCodeUnits(addr, addr.add(dt.getLength() - 1), false);
+                    listing.createData(addr, dt);
+
+                    success = true;
+                    result.set("Applied struct '" + structName + "' at " + addr +
+                              " (" + dt.getLength() + " bytes)");
+                } catch (Exception e) {
+                    Msg.error(this, "Error applying struct", e);
+                    result.set("Error applying struct: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute apply struct on Swing thread", e);
+        }
+
+        return result.get();
+    }
+
     // ----------------------------------------------------------------------------------
     // Utility: parse query params, parse post params, pagination, etc.
     // ----------------------------------------------------------------------------------
@@ -2202,6 +2164,13 @@ public class GhidraMCPPlugin extends Plugin {
             }
         }
         return result;
+    }
+
+    /**
+     * Read raw request body as a string (for JSON endpoints).
+     */
+    private String readRequestBody(HttpExchange exchange) throws IOException {
+        return new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
     }
 
     /**
@@ -2274,7 +2243,17 @@ public class GhidraMCPPlugin extends Plugin {
 
     public Program getCurrentProgram() {
         ProgramManager pm = tool.getService(ProgramManager.class);
-        return pm != null ? pm.getCurrentProgram() : null;
+        if (pm != null && pm.getCurrentProgram() != null) {
+            return pm.getCurrentProgram();
+        }
+        // ProgramManager returns null when plugin is loaded via Code Browser
+        // instead of a tool that directly provides ProgramManager. Fall back
+        // to CodeViewerService which is always available in Code Browser.
+        CodeViewerService cvs = tool.getService(CodeViewerService.class);
+        if (cvs != null && cvs.getNavigatable() != null) {
+            return cvs.getNavigatable().getProgram();
+        }
+        return null;
     }
 
     private void sendResponse(HttpExchange exchange, String response) throws IOException {
