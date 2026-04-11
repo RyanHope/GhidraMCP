@@ -85,6 +85,8 @@ public class GhidraMCPPlugin extends Plugin {
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
     private static final int DEFAULT_PORT = 8080;
+    private static final int PORT_FALLBACK_ATTEMPTS = 10;
+    private volatile String selectedProgramIdentity;
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -109,7 +111,7 @@ public class GhidraMCPPlugin extends Plugin {
     private void startServer() throws IOException {
         // Read the configured port
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
-        int port = options.getInt(PORT_OPTION_NAME, DEFAULT_PORT);
+        int configuredPort = options.getInt(PORT_OPTION_NAME, DEFAULT_PORT);
 
         // Stop existing server if running (e.g., if plugin is reloaded)
         if (server != null) {
@@ -118,7 +120,41 @@ public class GhidraMCPPlugin extends Plugin {
             server = null;
         }
 
-        server = HttpServer.create(new InetSocketAddress(port), 0);
+        HttpServer createdServer = null;
+        int boundPort = -1;
+        IOException lastBindError = null;
+
+        for (int i = 0; i < PORT_FALLBACK_ATTEMPTS; i++) {
+            int candidatePort = configuredPort + i;
+            try {
+                createdServer = HttpServer.create(new InetSocketAddress(candidatePort), 0);
+                boundPort = candidatePort;
+                break;
+            }
+            catch (IOException e) {
+                lastBindError = e;
+            }
+        }
+
+        if (createdServer == null) {
+            throw new IOException(
+                "Failed to bind GhidraMCP HTTP server; tried ports " + configuredPort + "-" +
+                (configuredPort + PORT_FALLBACK_ATTEMPTS - 1),
+                lastBindError
+            );
+        }
+
+        server = createdServer;
+
+        server.createContext("/list_open_programs", exchange -> {
+            sendResponse(exchange, listOpenPrograms());
+        });
+
+        server.createContext("/select_program", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String identifier = params.get("identifier");
+            sendResponse(exchange, selectProgram(identifier));
+        });
 
         // Each listing endpoint uses offset & limit from query params:
         server.createContext("/methods", exchange -> {
@@ -532,12 +568,20 @@ public class GhidraMCPPlugin extends Plugin {
         });
 
         server.setExecutor(null);
+        final int serverPort = boundPort;
+        final int preferredPort = configuredPort;
         new Thread(() -> {
             try {
                 server.start();
-                Msg.info(this, "GhidraMCP HTTP server started on port " + port);
+                if (serverPort == preferredPort) {
+                    Msg.info(this, "GhidraMCP HTTP server started on port " + serverPort);
+                }
+                else {
+                    Msg.info(this, "GhidraMCP HTTP server started on fallback port " + serverPort +
+                        " (preferred " + preferredPort + " was in use)");
+                }
             } catch (Exception e) {
-                Msg.error(this, "Failed to start HTTP server on port " + port + ". Port might be in use.", e);
+                Msg.error(this, "Failed to start HTTP server on port " + serverPort + ".", e);
                 server = null; // Ensure server isn't considered running
             }
         }, "GhidraMCP-HTTP-Server").start();
@@ -556,6 +600,111 @@ public class GhidraMCPPlugin extends Plugin {
             names.add(f.getName());
         }
         return paginateList(names, offset, limit);
+    }
+
+    private String listOpenPrograms() {
+        List<Program> programs = getOpenPrograms();
+        if (programs.isEmpty()) {
+            return "No programs open";
+        }
+
+        Program current = getToolCurrentProgram();
+        List<String> lines = new ArrayList<>();
+        for (Program program : programs) {
+            String identity = getProgramIdentity(program);
+            StringBuilder line = new StringBuilder(identity);
+            if (program == current) {
+                line.append(" [current]");
+            }
+            if (selectedProgramIdentity != null && selectedProgramIdentity.equals(identity)) {
+                line.append(" [selected]");
+            }
+            lines.add(line.toString());
+        }
+        return String.join("\n", lines);
+    }
+
+    private String selectProgram(String identifier) {
+        if (identifier == null || identifier.trim().isEmpty()) {
+            selectedProgramIdentity = null;
+            return "Program selection cleared; using current active program";
+        }
+
+        String candidate = identifier.trim();
+        List<Program> programs = getOpenPrograms();
+        if (programs.isEmpty()) {
+            return "No programs open";
+        }
+
+        Program exactMatch = null;
+        List<Program> byName = new ArrayList<>();
+
+        for (Program program : programs) {
+            String identity = getProgramIdentity(program);
+            if (identity.equalsIgnoreCase(candidate)) {
+                exactMatch = program;
+                break;
+            }
+            if (program.getName().equalsIgnoreCase(candidate)) {
+                byName.add(program);
+            }
+        }
+
+        Program selected = exactMatch;
+        if (selected == null) {
+            if (byName.size() == 1) {
+                selected = byName.get(0);
+            }
+            else if (byName.size() > 1) {
+                List<String> matches = new ArrayList<>();
+                for (Program p : byName) {
+                    matches.add(getProgramIdentity(p));
+                }
+                return "Ambiguous program name; use full identifier:\n" + String.join("\n", matches);
+            }
+        }
+
+        if (selected == null) {
+            return "Program not found: " + candidate;
+        }
+
+        selectedProgramIdentity = getProgramIdentity(selected);
+        return "Selected program: " + selectedProgramIdentity;
+    }
+
+    private List<Program> getOpenPrograms() {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm != null) {
+            Program[] open = pm.getAllOpenPrograms();
+            if (open != null && open.length > 0) {
+                return Arrays.asList(open);
+            }
+        }
+
+        Program current = getToolCurrentProgram();
+        if (current != null) {
+            return Collections.singletonList(current);
+        }
+        return Collections.emptyList();
+    }
+
+    private String getProgramIdentity(Program program) {
+        if (program.getDomainFile() != null) {
+            return program.getDomainFile().getPathname();
+        }
+        return program.getName();
+    }
+
+    private Program getToolCurrentProgram() {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm != null && pm.getCurrentProgram() != null) {
+            return pm.getCurrentProgram();
+        }
+        CodeViewerService cvs = tool.getService(CodeViewerService.class);
+        if (cvs != null && cvs.getNavigatable() != null) {
+            return cvs.getNavigatable().getProgram();
+        }
+        return null;
     }
 
     private String getAllClassNames(int offset, int limit) {
@@ -2969,18 +3118,15 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     public Program getCurrentProgram() {
-        ProgramManager pm = tool.getService(ProgramManager.class);
-        if (pm != null && pm.getCurrentProgram() != null) {
-            return pm.getCurrentProgram();
+        if (selectedProgramIdentity != null) {
+            for (Program program : getOpenPrograms()) {
+                if (selectedProgramIdentity.equals(getProgramIdentity(program))) {
+                    return program;
+                }
+            }
+            selectedProgramIdentity = null;
         }
-        // ProgramManager returns null when plugin is loaded via Code Browser
-        // instead of a tool that directly provides ProgramManager. Fall back
-        // to CodeViewerService which is always available in Code Browser.
-        CodeViewerService cvs = tool.getService(CodeViewerService.class);
-        if (cvs != null && cvs.getNavigatable() != null) {
-            return cvs.getNavigatable().getProgram();
-        }
-        return null;
+        return getToolCurrentProgram();
     }
 
     private void sendResponse(HttpExchange exchange, String response) throws IOException {

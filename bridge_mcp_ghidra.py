@@ -146,6 +146,28 @@ def list_ghidra_instances() -> list:
             for name, info in instances.items()]
 
 @mcp.tool()
+def list_open_programs(target_binary: str = None) -> list:
+    """
+    List open programs in a Ghidra instance.
+    Use this to find valid identifiers for select_program.
+    Provide target_binary if multiple Ghidra windows are open.
+    """
+    return safe_get("list_open_programs", None, target_binary)
+
+@mcp.tool()
+def select_program(identifier: str = None, target_binary: str = None) -> str:
+    """
+    Select which open program MCP operations should target in the chosen instance.
+    Pass identifier from list_open_programs output.
+    Pass empty or omit identifier to clear selection and use current active program.
+    Provide target_binary if multiple Ghidra windows are open.
+    """
+    data = {}
+    if identifier is not None:
+        data["identifier"] = identifier
+    return safe_post("select_program", data, target_binary)
+
+@mcp.tool()
 def list_methods(offset: int = 0, limit: int = 100, target_binary: str = None) -> list:
     """
     List all function names in the program with pagination.
