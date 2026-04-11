@@ -209,6 +209,17 @@ def disassemble_function(address: str) -> list:
     return safe_get("disassemble_function", {"address": address})
 
 @mcp.tool()
+def disassemble_region(address: str, length: int = 0x100, max_instructions: int = 512) -> list:
+    """
+    Disassemble a raw address range without requiring a function definition.
+    """
+    return safe_get("disassemble_region", {
+        "address": address,
+        "length": length,
+        "max_instructions": max_instructions,
+    })
+
+@mcp.tool()
 def set_decompiler_comment(address: str, comment: str) -> str:
     """
     Set a comment for a given address in the function pseudocode.
@@ -330,6 +341,22 @@ def define_data(address: str, data_type: str, label: str = None) -> str:
     return safe_post("define_data", data)
 
 @mcp.tool()
+def create_array(address: str, base_type: str, dimensions: list[int], label: str = None) -> str:
+    """
+    Create an array data definition at an address.
+    Example: base_type="ushort", dimensions=[12, 27] creates ushort[12][27].
+    """
+    dims = ",".join(str(int(d)) for d in dimensions)
+    data = {
+        "address": address,
+        "base_type": base_type,
+        "dimensions": dims,
+    }
+    if label:
+        data["label"] = label
+    return safe_post("create_array", data)
+
+@mcp.tool()
 def define_data_batch(items: list[dict]) -> str:
     """
     Create multiple data definitions in a single transaction.
@@ -342,7 +369,8 @@ def read_bytes(address: str, length: int) -> str:
     """
     Read raw bytes from memory at a given address. Returns hex-encoded string.
     """
-    return safe_get("read_bytes", {"address": address, "length": length})
+    lines = safe_get("read_bytes", {"address": address, "length": length})
+    return lines[0] if lines else ""
 
 @mcp.tool()
 def get_data_at(address: str) -> str:
@@ -350,7 +378,7 @@ def get_data_at(address: str) -> str:
     Get detailed info about the data item at a specific address:
     type, size, label, value, and containing item info.
     """
-    return safe_get("get_data_at", {"address": address})
+    return "\n".join(safe_get("get_data_at", {"address": address}))
 
 @mcp.tool()
 def batch_rename_functions(renames: list[dict]) -> str:
@@ -383,6 +411,29 @@ def create_label(address: str, name: str, namespace: str = None) -> str:
     return safe_post("create_label", data)
 
 @mcp.tool()
+def create_function(address: str, name: str = None, use_auto_body: bool = False, force_recreate: bool = False) -> str:
+    """
+    Create a function at an address.
+    - address: function entry address
+    - name: optional user-defined function name
+    - use_auto_body: if true, attempt to discover function body automatically
+    - force_recreate: if true, remove any existing function at entry address first
+    """
+    data = {"address": address}
+    if name:
+        data["name"] = name
+    data["use_auto_body"] = str(use_auto_body).lower()
+    data["force_recreate"] = str(force_recreate).lower()
+    return safe_post("create_function", data)
+
+@mcp.tool()
+def delete_function(address: str) -> str:
+    """
+    Delete a function at the given address, or the containing function.
+    """
+    return safe_post("delete_function", {"address": address})
+
+@mcp.tool()
 def create_enum(name: str, values: list[dict], size: int = 4) -> str:
     """
     Create an enum data type. Each value: {"name": "MEMBER_NAME", "value": 0}
@@ -392,6 +443,13 @@ def create_enum(name: str, values: list[dict], size: int = 4) -> str:
         "size": size,
         "values": values
     })
+
+@mcp.tool()
+def delete_enum(name: str) -> str:
+    """
+    Delete an enum datatype by exact name.
+    """
+    return safe_post("delete_enum", {"name": name})
 
 @mcp.tool()
 def create_struct(name: str, fields: list[dict]) -> str:
@@ -412,6 +470,90 @@ def apply_struct(address: str, struct_name: str) -> str:
     Clears existing data at the address range and stamps the struct.
     """
     return safe_post("apply_struct", {"address": address, "struct_name": struct_name})
+
+@mcp.tool()
+def list_memory_blocks(offset: int = 0, limit: int = 200) -> list:
+    """
+    List memory blocks with range, permissions, mapping, and overlay metadata.
+    """
+    return safe_get("list_memory_blocks", {"offset": offset, "limit": limit})
+
+@mcp.tool()
+def create_byte_mapped_block(
+    name: str,
+    start: str,
+    mapped_start: str,
+    length: int,
+    overlay: bool = True,
+    read: bool = True,
+    write: bool = False,
+    execute: bool = True,
+    comment: str = None,
+    source_name: str = None,
+    is_volatile: bool = False,
+    artificial: bool = False,
+) -> str:
+    """
+    Create a byte-mapped memory block. Useful for runtime-window overlays.
+    """
+    data = {
+        "name": name,
+        "start": start,
+        "mapped_start": mapped_start,
+        "length": str(length),
+        "overlay": str(overlay).lower(),
+        "read": str(read).lower(),
+        "write": str(write).lower(),
+        "execute": str(execute).lower(),
+        "volatile": str(is_volatile).lower(),
+        "artificial": str(artificial).lower(),
+    }
+    if comment is not None:
+        data["comment"] = comment
+    if source_name is not None:
+        data["source_name"] = source_name
+    return safe_post("create_byte_mapped_block", data)
+
+@mcp.tool()
+def set_memory_block_permissions(block: str, read: bool, write: bool, execute: bool) -> str:
+    """
+    Set read/write/execute permissions on a memory block by name or address.
+    """
+    return safe_post("set_memory_block_permissions", {
+        "block": block,
+        "read": str(read).lower(),
+        "write": str(write).lower(),
+        "execute": str(execute).lower(),
+    })
+
+@mcp.tool()
+def set_memory_block_metadata(
+    block: str,
+    comment: str = None,
+    source_name: str = None,
+    is_volatile: bool = None,
+    artificial: bool = None,
+) -> str:
+    """
+    Update memory block metadata (comment/source/volatile/artificial) by block name or address.
+    """
+    data = {"block": block}
+    if comment is not None:
+        data["comment"] = comment
+    if source_name is not None:
+        data["source_name"] = source_name
+    if is_volatile is not None:
+        data["volatile"] = str(is_volatile).lower()
+    if artificial is not None:
+        data["artificial"] = str(artificial).lower()
+    return safe_post("set_memory_block_metadata", data)
+
+@mcp.tool()
+def delete_memory_block(block: str) -> str:
+    """
+    Delete a memory block by name or address.
+    """
+    return safe_post("delete_memory_block", {"block": block})
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")

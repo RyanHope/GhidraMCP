@@ -23,6 +23,8 @@ import ghidra.app.services.CodeViewerService;
 import ghidra.app.services.ProgramManager;
 import ghidra.app.util.PseudoDisassembler;
 import ghidra.app.cmd.function.SetVariableNameCmd;
+import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.program.model.symbol.SourceType;
 import ghidra.program.model.listing.LocalVariableImpl;
 import ghidra.program.model.listing.ParameterImpl;
@@ -41,8 +43,10 @@ import ghidra.program.model.data.DataTypeManager;
 import ghidra.program.model.data.DataTypeConflictHandler;
 import ghidra.program.model.data.PointerDataType;
 import ghidra.program.model.data.Undefined1DataType;
+import ghidra.program.model.data.UnsignedShortDataType;
 import ghidra.program.model.data.EnumDataType;
 import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.ArrayDataType;
 import ghidra.program.model.data.CategoryPath;
 
 import com.google.gson.JsonArray;
@@ -233,6 +237,14 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, disassembleFunction(address));
         });
 
+        server.createContext("/disassemble_region", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            int length = parseIntOrDefault(qparams.get("length"), 0x100);
+            int maxInstructions = parseIntOrDefault(qparams.get("max_instructions"), 512);
+            sendResponse(exchange, disassembleRegion(address, length, maxInstructions));
+        });
+
         server.createContext("/set_decompiler_comment", exchange -> {
             Map<String, String> params = parsePostParams(exchange);
             String address = params.get("address");
@@ -368,6 +380,16 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, result);
         });
 
+        server.createContext("/create_array", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String baseType = params.get("base_type");
+            String dimensions = params.get("dimensions");
+            String label = params.get("label");
+            String result = createArray(address, baseType, dimensions, label);
+            sendResponse(exchange, result);
+        });
+
         server.createContext("/define_data_batch", exchange -> {
             String body = readRequestBody(exchange);
             String result = defineDataBatch(body);
@@ -410,9 +432,33 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, result);
         });
 
+        server.createContext("/create_function", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String name = params.get("name");
+            boolean useAutoBody = "true".equalsIgnoreCase(params.get("use_auto_body"));
+            boolean forceRecreate = "true".equalsIgnoreCase(params.get("force_recreate"));
+            String result = createFunction(address, name, useAutoBody, forceRecreate);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/delete_function", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String result = deleteFunction(address);
+            sendResponse(exchange, result);
+        });
+
         server.createContext("/create_enum", exchange -> {
             String body = readRequestBody(exchange);
             String result = createEnum(body);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/delete_enum", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String name = params.get("name");
+            String result = deleteEnum(name);
             sendResponse(exchange, result);
         });
 
@@ -427,6 +473,61 @@ public class GhidraMCPPlugin extends Plugin {
             String address = params.get("address");
             String structName = params.get("struct_name");
             String result = applyStruct(address, structName);
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/list_memory_blocks", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  200);
+            sendResponse(exchange, listMemoryBlocks(offset, limit));
+        });
+
+        server.createContext("/create_byte_mapped_block", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String result = createByteMappedBlock(
+                params.get("name"),
+                params.get("start"),
+                params.get("mapped_start"),
+                params.get("length"),
+                parseBooleanOrDefault(params.get("overlay"), true),
+                params.get("comment"),
+                params.get("source_name"),
+                parseBooleanOrDefault(params.get("read"), true),
+                parseBooleanOrDefault(params.get("write"), false),
+                parseBooleanOrDefault(params.get("execute"), true),
+                parseBooleanOrDefault(params.get("volatile"), false),
+                parseBooleanOrDefault(params.get("artificial"), false)
+            );
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/set_memory_block_permissions", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String result = setMemoryBlockPermissions(
+                params.get("block"),
+                parseBooleanOrDefault(params.get("read"), true),
+                parseBooleanOrDefault(params.get("write"), false),
+                parseBooleanOrDefault(params.get("execute"), false)
+            );
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/set_memory_block_metadata", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String result = setMemoryBlockMetadata(
+                params.get("block"),
+                params.get("comment"),
+                params.get("source_name"),
+                params.get("volatile"),
+                params.get("artificial")
+            );
+            sendResponse(exchange, result);
+        });
+
+        server.createContext("/delete_memory_block", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String result = deleteMemoryBlock(params.get("block"));
             sendResponse(exchange, result);
         });
 
@@ -943,6 +1044,58 @@ public class GhidraMCPPlugin extends Plugin {
             return "Error disassembling function: " + e.getMessage();
         }
     }    
+
+    /**
+     * Disassemble a raw address range without requiring a pre-existing function.
+     */
+    private String disassembleRegion(String addressStr, int length, int maxInstructions) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (length <= 0) return "Length must be > 0";
+        if (maxInstructions <= 0) return "max_instructions must be > 0";
+
+        try {
+            Address start = program.getAddressFactory().getAddress(addressStr);
+            Address end = start.add(length - 1L);
+
+            // Force disassembly from the start address over the requested range.
+            int tx = program.startTransaction("Disassemble region");
+            try {
+                DisassembleCommand disCmd = new DisassembleCommand(start, null, true);
+                disCmd.applyTo(program, new ConsoleTaskMonitor());
+            } finally {
+                program.endTransaction(tx, true);
+            }
+
+            StringBuilder result = new StringBuilder();
+            Listing listing = program.getListing();
+            InstructionIterator instructions = listing.getInstructions(start, true);
+            int count = 0;
+
+            while (instructions.hasNext() && count < maxInstructions) {
+                Instruction instr = instructions.next();
+                Address instrAddr = instr.getAddress();
+                if (instrAddr.compareTo(end) > 0) {
+                    break;
+                }
+
+                String comment = listing.getComment(CodeUnit.EOL_COMMENT, instrAddr);
+                comment = (comment != null) ? "; " + comment : "";
+
+                result.append(String.format("%s: %s %s\n", instrAddr, instr.toString(), comment));
+                count++;
+            }
+
+            if (result.length() == 0) {
+                return "No instructions decoded in range " + start + " - " + end;
+            }
+
+            return result.toString();
+        } catch (Exception e) {
+            return "Error disassembling region: " + e.getMessage();
+        }
+    }
 
     /**
      * Set a comment using the specified comment type (PRE_COMMENT or EOL_COMMENT)
@@ -1509,16 +1662,31 @@ public class GhidraMCPPlugin extends Plugin {
      * @return The resolved DataType, or null if not found
      */
     private DataType resolveDataType(DataTypeManager dtm, String typeName) {
+        if (typeName == null) {
+            return null;
+        }
+
+        String normalizedTypeName = typeName.trim();
+        if (normalizedTypeName.isEmpty()) {
+            return null;
+        }
+
+        // Support array notation like ushort[12][27].
+        DataType arrayType = resolveArrayDataType(dtm, normalizedTypeName);
+        if (arrayType != null) {
+            return arrayType;
+        }
+
         // First try to find exact match in all categories
-        DataType dataType = findDataTypeByNameInAllCategories(dtm, typeName);
+        DataType dataType = findDataTypeByNameInAllCategories(dtm, normalizedTypeName);
         if (dataType != null) {
             Msg.info(this, "Found exact data type match: " + dataType.getPathName());
             return dataType;
         }
 
         // Check for Windows-style pointer types (PXXX)
-        if (typeName.startsWith("P") && typeName.length() > 1) {
-            String baseTypeName = typeName.substring(1);
+        if (normalizedTypeName.startsWith("P") && normalizedTypeName.length() > 1) {
+            String baseTypeName = normalizedTypeName.substring(1);
 
             // Special case for PVOID
             if (baseTypeName.equals("VOID")) {
@@ -1531,12 +1699,12 @@ public class GhidraMCPPlugin extends Plugin {
                 return new PointerDataType(baseType);
             }
 
-            Msg.warn(this, "Base type not found for " + typeName + ", defaulting to void*");
+            Msg.warn(this, "Base type not found for " + normalizedTypeName + ", defaulting to void*");
             return new PointerDataType(dtm.getDataType("/void"));
         }
 
         // Handle common built-in types
-        switch (typeName.toLowerCase()) {
+        switch (normalizedTypeName.toLowerCase()) {
             case "int":
             case "long":
                 return dtm.getDataType("/int");
@@ -1550,7 +1718,8 @@ public class GhidraMCPPlugin extends Plugin {
             case "ushort":
             case "unsigned short":
             case "word":
-                return dtm.getDataType("/ushort");
+                DataType ushortType = dtm.getDataType("/ushort");
+                return (ushortType != null) ? ushortType : UnsignedShortDataType.dataType;
             case "char":
             case "byte":
                 return dtm.getDataType("/char");
@@ -1578,15 +1747,71 @@ public class GhidraMCPPlugin extends Plugin {
                 return dtm.getDataType("/void");
             default:
                 // Try as a direct path
-                DataType directType = dtm.getDataType("/" + typeName);
+                DataType directType = dtm.getDataType("/" + normalizedTypeName);
                 if (directType != null) {
                     return directType;
                 }
 
                 // Fallback to int if we couldn't find it
-                Msg.warn(this, "Unknown type: " + typeName + ", defaulting to int");
+                Msg.warn(this, "Unknown type: " + normalizedTypeName + ", defaulting to int");
                 return dtm.getDataType("/int");
         }
+    }
+
+    /**
+     * Resolve array notation into nested ArrayDataType objects, e.g. ushort[12][27].
+     */
+    private DataType resolveArrayDataType(DataTypeManager dtm, String typeName) {
+        int firstBracket = typeName.indexOf('[');
+        if (firstBracket < 0) {
+            return null;
+        }
+
+        String baseTypeName = typeName.substring(0, firstBracket).trim();
+        if (baseTypeName.isEmpty()) {
+            return null;
+        }
+
+        List<Integer> dimensions = new ArrayList<>();
+        int i = firstBracket;
+        while (i < typeName.length()) {
+            if (typeName.charAt(i) != '[') {
+                return null;
+            }
+            int close = typeName.indexOf(']', i + 1);
+            if (close < 0) {
+                return null;
+            }
+
+            String dimText = typeName.substring(i + 1, close).trim();
+            if (dimText.isEmpty()) {
+                return null;
+            }
+
+            int dim;
+            try {
+                dim = Integer.parseInt(dimText);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+
+            if (dim <= 0) {
+                return null;
+            }
+            dimensions.add(dim);
+            i = close + 1;
+        }
+
+        DataType baseType = resolveDataType(dtm, baseTypeName);
+        if (baseType == null) {
+            return null;
+        }
+
+        DataType current = baseType;
+        for (int idx = dimensions.size() - 1; idx >= 0; idx--) {
+            current = new ArrayDataType(current, dimensions.get(idx), current.getLength());
+        }
+        return current;
     }
     
     /**
@@ -1707,6 +1932,88 @@ public class GhidraMCPPlugin extends Plugin {
             });
         } catch (InterruptedException | InvocationTargetException e) {
             Msg.error(this, "Failed to execute define data on Swing thread", e);
+        }
+
+        return result.get();
+    }
+
+    private String createArray(String addressStr, String baseTypeName, String dimensionsStr, String label) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (baseTypeName == null || baseTypeName.isEmpty()) return "Base type is required";
+        if (dimensionsStr == null || dimensionsStr.isEmpty()) return "Dimensions are required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to create array");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create array");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    Listing listing = program.getListing();
+
+                    DataType baseType = resolveDataType(dtm, baseTypeName.trim());
+                    if (baseType == null) {
+                        result.set("Unknown base type: " + baseTypeName);
+                        return;
+                    }
+
+                    String[] dimParts = dimensionsStr.split(",");
+                    if (dimParts.length == 0) {
+                        result.set("At least one dimension is required");
+                        return;
+                    }
+
+                    List<Integer> dims = new ArrayList<>();
+                    for (String part : dimParts) {
+                        String trimmed = part.trim();
+                        if (trimmed.isEmpty()) {
+                            result.set("Invalid dimensions string: " + dimensionsStr);
+                            return;
+                        }
+                        int dim = Integer.parseInt(trimmed);
+                        if (dim <= 0) {
+                            result.set("Array dimensions must be > 0");
+                            return;
+                        }
+                        dims.add(dim);
+                    }
+
+                    DataType arrayType = baseType;
+                    for (int idx = dims.size() - 1; idx >= 0; idx--) {
+                        arrayType = new ArrayDataType(arrayType, dims.get(idx), arrayType.getLength());
+                    }
+
+                    Data existing = listing.getDataContaining(addr);
+                    if (existing != null) {
+                        listing.clearCodeUnits(existing.getAddress(), existing.getMaxAddress(), false);
+                    }
+
+                    listing.createData(addr, arrayType);
+
+                    if (label != null && !label.isEmpty()) {
+                        program.getSymbolTable().createLabel(addr, label, SourceType.USER_DEFINED);
+                    }
+
+                    success = true;
+                    result.set("Created array " + baseTypeName + "[" +
+                        String.join("][", dimParts) + "] at " + addr +
+                        (label != null && !label.isEmpty() ? " with label " + label : ""));
+                } catch (NumberFormatException e) {
+                    result.set("Invalid dimensions (must be comma-separated integers): " + dimensionsStr);
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating array", e);
+                    result.set("Error creating array: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute create array on Swing thread", e);
+            return "Failed to execute create array on Swing thread: " + e.getMessage();
         }
 
         return result.get();
@@ -1998,6 +2305,132 @@ public class GhidraMCPPlugin extends Plugin {
         return result.get();
     }
 
+    private String createFunction(String addressStr, String name, boolean useAutoBody, boolean forceRecreate) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to create function");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create function");
+                boolean success = false;
+                try {
+                    Address entry = program.getAddressFactory().getAddress(addressStr);
+                    FunctionManager fm = program.getFunctionManager();
+                    Listing listing = program.getListing();
+
+                    Function existingAtEntry = fm.getFunctionAt(entry);
+                    if (existingAtEntry != null) {
+                        if (forceRecreate) {
+                            fm.removeFunction(entry);
+                        } else {
+                            if (name != null && !name.isEmpty()) {
+                                existingAtEntry.setName(name, SourceType.USER_DEFINED);
+                            }
+                            success = true;
+                            result.set("Function already exists at " + entry +
+                                (name != null && !name.isEmpty() ? ", renamed to " + existingAtEntry.getName() : ""));
+                            return;
+                        }
+                    }
+
+                    Function func;
+                    if (useAutoBody) {
+                        // Ensure instructions exist so function discovery can grow past entrypoint.
+                        DisassembleCommand disCmd = new DisassembleCommand(entry, null, true);
+                        disCmd.applyTo(program, new ConsoleTaskMonitor());
+
+                        CreateFunctionCmd cmd = new CreateFunctionCmd(name, entry, null, SourceType.USER_DEFINED);
+                        boolean applied = cmd.applyTo(program, new ConsoleTaskMonitor());
+                        if (!applied) {
+                            result.set("Failed to auto-create function at " + entry + ": " + cmd.getStatusMsg());
+                            return;
+                        }
+                        func = fm.getFunctionAt(entry);
+                    } else {
+                        // Minimal single-instruction body anchored at entrypoint.
+                        CodeUnit cu = listing.getCodeUnitAt(entry);
+                        Address end = (cu != null) ? cu.getMaxAddress() : entry;
+                        ghidra.program.model.address.AddressSet body =
+                                new ghidra.program.model.address.AddressSet(entry, end);
+                        func = fm.createFunction(name, entry, body, SourceType.USER_DEFINED);
+                    }
+                    if (func == null) {
+                        result.set("Function creation returned null at " + entry);
+                        return;
+                    }
+
+                    if (name != null && !name.isEmpty()) {
+                        func.setName(name, SourceType.USER_DEFINED);
+                    }
+
+                    success = true;
+                    result.set("Created function " + func.getName() + " at " + func.getEntryPoint());
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating function", e);
+                    result.set("Error creating function: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute create function on Swing thread", e);
+            return "Failed to execute create function on Swing thread: " + e.getMessage();
+        }
+
+        return result.get();
+    }
+
+    private String deleteFunction(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to delete function");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Delete function");
+                boolean success = false;
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    FunctionManager fm = program.getFunctionManager();
+
+                    Function func = fm.getFunctionAt(addr);
+                    if (func == null) {
+                        func = fm.getFunctionContaining(addr);
+                    }
+
+                    if (func == null) {
+                        result.set("No function found at or containing " + addr);
+                        return;
+                    }
+
+                    Address entry = func.getEntryPoint();
+                    if (!fm.removeFunction(entry)) {
+                        result.set("Failed to remove function at " + entry);
+                        return;
+                    }
+
+                    success = true;
+                    result.set("Deleted function at " + entry);
+                } catch (Exception e) {
+                    Msg.error(this, "Error deleting function", e);
+                    result.set("Error deleting function: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute delete function on Swing thread", e);
+            return "Failed to execute delete function on Swing thread: " + e.getMessage();
+        }
+
+        return result.get();
+    }
+
     private String createEnum(String jsonBody) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
@@ -2037,6 +2470,52 @@ public class GhidraMCPPlugin extends Plugin {
             });
         } catch (Exception e) {
             result.set("Error parsing JSON: " + e.getMessage());
+        }
+
+        return result.get();
+    }
+
+    private String deleteEnum(String name) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (name == null || name.isEmpty()) return "Enum name is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to delete enum");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Delete enum");
+                boolean success = false;
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType found = null;
+                    Iterator<DataType> it = dtm.getAllDataTypes();
+                    while (it.hasNext()) {
+                        DataType dt = it.next();
+                        if (dt instanceof EnumDataType && dt.getName().equals(name)) {
+                            found = dt;
+                            break;
+                        }
+                    }
+
+                    if (found == null) {
+                        result.set("Enum not found: " + name);
+                        return;
+                    }
+
+                    dtm.remove(found, TaskMonitor.DUMMY);
+                    success = true;
+                    result.set("Deleted enum '" + name + "'");
+                } catch (Exception e) {
+                    Msg.error(this, "Error deleting enum", e);
+                    result.set("Error deleting enum: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute delete enum on Swing thread", e);
+            return "Failed to execute delete enum on Swing thread: " + e.getMessage();
         }
 
         return result.get();
@@ -2137,6 +2616,247 @@ public class GhidraMCPPlugin extends Plugin {
         return result.get();
     }
 
+    private String listMemoryBlocks(int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+
+        List<String> lines = new ArrayList<>();
+        for (MemoryBlock block : program.getMemory().getBlocks()) {
+            lines.add(String.format(
+                "%s: %s - %s | size=%d | perms=%s%s%s | overlay=%s | mapped=%s | type=%s | source=%s",
+                block.getName(),
+                block.getStart(),
+                block.getEnd(),
+                block.getSize(),
+                block.isRead() ? "r" : "-",
+                block.isWrite() ? "w" : "-",
+                block.isExecute() ? "x" : "-",
+                block.isOverlay(),
+                block.isMapped(),
+                block.getType(),
+                block.getSourceName()
+            ));
+        }
+        return paginateList(lines, offset, limit);
+    }
+
+    private MemoryBlock resolveMemoryBlock(Program program, String blockId) {
+        if (program == null || blockId == null || blockId.isEmpty()) {
+            return null;
+        }
+
+        MemoryBlock block = program.getMemory().getBlock(blockId);
+        if (block != null) {
+            return block;
+        }
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(blockId);
+            return program.getMemory().getBlock(addr);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String createByteMappedBlock(String name, String startStr, String mappedStartStr,
+                                         String lengthStr, boolean overlay, String comment,
+                                         String sourceName, boolean read, boolean write,
+                                         boolean execute, boolean isVolatile, boolean artificial) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (name == null || name.isEmpty()) return "Block name is required";
+        if (startStr == null || startStr.isEmpty()) return "Start address is required";
+        if (mappedStartStr == null || mappedStartStr.isEmpty()) return "Mapped start address is required";
+        if (lengthStr == null || lengthStr.isEmpty()) return "Length is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to create byte-mapped block");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create byte-mapped block");
+                boolean success = false;
+                try {
+                    Address start = program.getAddressFactory().getAddress(startStr);
+                    Address mappedStart = program.getAddressFactory().getAddress(mappedStartStr);
+                    long length = Long.parseLong(lengthStr);
+
+                    Object memory = program.getMemory();
+                    java.lang.reflect.Method createMethod = memory.getClass().getMethod(
+                        "createByteMappedBlock",
+                        String.class,
+                        Address.class,
+                        Address.class,
+                        long.class,
+                        boolean.class
+                    );
+                    MemoryBlock block = (MemoryBlock) createMethod.invoke(
+                        memory,
+                        name,
+                        start,
+                        mappedStart,
+                        length,
+                        overlay
+                    );
+
+                    block.setPermissions(read, write, execute);
+                    block.setVolatile(isVolatile);
+                    block.setArtificial(artificial);
+                    if (comment != null) {
+                        block.setComment(comment);
+                    }
+                    if (sourceName != null && !sourceName.isEmpty()) {
+                        block.setSourceName(sourceName);
+                    }
+
+                    success = true;
+                    result.set("Created byte-mapped block '" + name + "' at " + start +
+                            " mapped from " + mappedStart + " length=" + length +
+                            " overlay=" + overlay);
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating byte-mapped block", e);
+                    result.set("Error creating byte-mapped block: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute create byte-mapped block on Swing thread", e);
+            return "Failed to execute create byte-mapped block on Swing thread: " + e.getMessage();
+        }
+
+        return result.get();
+    }
+
+    private String setMemoryBlockPermissions(String blockId, boolean read, boolean write, boolean execute) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (blockId == null || blockId.isEmpty()) return "Block name or address is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to set block permissions");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Set memory block permissions");
+                boolean success = false;
+                try {
+                    MemoryBlock block = resolveMemoryBlock(program, blockId);
+                    if (block == null) {
+                        result.set("Memory block not found: " + blockId);
+                        return;
+                    }
+
+                    block.setPermissions(read, write, execute);
+                    success = true;
+                    result.set("Updated permissions for '" + block.getName() + "' to " +
+                            (read ? "r" : "-") + (write ? "w" : "-") + (execute ? "x" : "-"));
+                } catch (Exception e) {
+                    Msg.error(this, "Error setting memory block permissions", e);
+                    result.set("Error setting memory block permissions: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute set block permissions on Swing thread", e);
+            return "Failed to execute set block permissions on Swing thread: " + e.getMessage();
+        }
+
+        return result.get();
+    }
+
+    private String setMemoryBlockMetadata(String blockId, String comment, String sourceName,
+                                          String volatileStr, String artificialStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (blockId == null || blockId.isEmpty()) return "Block name or address is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to set block metadata");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Set memory block metadata");
+                boolean success = false;
+                try {
+                    MemoryBlock block = resolveMemoryBlock(program, blockId);
+                    if (block == null) {
+                        result.set("Memory block not found: " + blockId);
+                        return;
+                    }
+
+                    if (comment != null) {
+                        block.setComment(comment);
+                    }
+                    if (sourceName != null && !sourceName.isEmpty()) {
+                        block.setSourceName(sourceName);
+                    }
+                    if (volatileStr != null) {
+                        block.setVolatile(parseBooleanOrDefault(volatileStr, block.isVolatile()));
+                    }
+                    if (artificialStr != null) {
+                        block.setArtificial(parseBooleanOrDefault(artificialStr, block.isArtificial()));
+                    }
+
+                    success = true;
+                    result.set("Updated metadata for '" + block.getName() + "'");
+                } catch (Exception e) {
+                    Msg.error(this, "Error setting memory block metadata", e);
+                    result.set("Error setting memory block metadata: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute set block metadata on Swing thread", e);
+            return "Failed to execute set block metadata on Swing thread: " + e.getMessage();
+        }
+
+        return result.get();
+    }
+
+    private String deleteMemoryBlock(String blockId) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (blockId == null || blockId.isEmpty()) return "Block name or address is required";
+
+        AtomicReference<String> result = new AtomicReference<>("Failed to delete memory block");
+
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Delete memory block");
+                boolean success = false;
+                try {
+                    MemoryBlock block = resolveMemoryBlock(program, blockId);
+                    if (block == null) {
+                        result.set("Memory block not found: " + blockId);
+                        return;
+                    }
+
+                    String blockName = block.getName();
+                    Object memory = program.getMemory();
+                    java.lang.reflect.Method removeMethod = memory.getClass().getMethod(
+                        "removeBlock",
+                        MemoryBlock.class,
+                        TaskMonitor.class
+                    );
+                    removeMethod.invoke(memory, block, TaskMonitor.DUMMY);
+
+                    success = true;
+                    result.set("Deleted memory block '" + blockName + "'");
+                } catch (Exception e) {
+                    Msg.error(this, "Error deleting memory block", e);
+                    result.set("Error deleting memory block: " + e.getMessage());
+                } finally {
+                    program.endTransaction(tx, success);
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Failed to execute delete memory block on Swing thread", e);
+            return "Failed to execute delete memory block on Swing thread: " + e.getMessage();
+        }
+
+        return result.get();
+    }
+
     // ----------------------------------------------------------------------------------
     // Utility: parse query params, parse post params, pagination, etc.
     // ----------------------------------------------------------------------------------
@@ -2221,6 +2941,13 @@ public class GhidraMCPPlugin extends Plugin {
         catch (NumberFormatException e) {
             return defaultValue;
         }
+    }
+
+    private boolean parseBooleanOrDefault(String val, boolean defaultValue) {
+        if (val == null) return defaultValue;
+        if ("true".equalsIgnoreCase(val) || "1".equals(val) || "yes".equalsIgnoreCase(val)) return true;
+        if ("false".equalsIgnoreCase(val) || "0".equals(val) || "no".equalsIgnoreCase(val)) return false;
+        return defaultValue;
     }
 
     /**
