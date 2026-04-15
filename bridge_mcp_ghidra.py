@@ -56,6 +56,12 @@ def get_instance_url(target_binary=None):
         discover_instances()
         if target_binary in active_instances:
             return active_instances[target_binary]["url"]
+    # No target specified — auto-discover if we have no known instances
+    if not active_instances:
+        discover_instances()
+    # If exactly one instance is known, use it automatically
+    if len(active_instances) == 1:
+        return next(iter(active_instances.values()))["url"]
     return f"http://127.0.0.1:{primary_port}/"
 
 # HTTP client with connection pooling
